@@ -1,0 +1,26 @@
+[package]
+name = "experiments"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[profile.release]
+debug = true
+
+[dependencies]
+anyhow = "1.0.62"
+bytemuck = "1.12.1"
+criterion = "0.3.6"
+image = "0.24.3"
+itertools = "0.10.3"
+jpeg-decoder = "0.2.6"
+palette = "0.6.1"
+rand = "0.8.5"
+
+[[bench]]
+name = "my_benchmark"
+harness = false
+
+# [[example]]
+# name = "foo"
