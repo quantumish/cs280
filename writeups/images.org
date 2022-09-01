@@ -1,7 +1,9 @@
 
 
 #+TITLE: Image Manipulation
+#+HTML_HEAD: <link rel="stylesheet" href="https://quantumish.github.io/admonition.css">
 #+HTML_HEAD: <link rel="stylesheet" href="https://quantumish.github.io/org.css">
+#+HTML_HEAD: <link rel="stylesheet" href="https://quantumish.github.io/org-htmlize.css">
 
 This is my writeup for the first assignment! Please run the associated code in the root directory first by running:
 #+begin_src sh
@@ -58,7 +60,7 @@ How do we make this function quick? It's actually not that hard! The compiler do
   }
 #+end_src
 
-Glancing at the assembly output of ~cargo asm~ (an awesome tool you can install with =cargo install cargo-asm=!) we might be disappointed to see that the compiler is /not/ using SIMD instructions to dim many bytes of RGB at once!
+Glancing at the assembly output of ~cargo asm~ (an awesome tool you can install with ~cargo install cargo-asm~!) we might be disappointed to see that the compiler is /not/ using SIMD instructions to dim many bytes of RGB at once!
 
 #+begin_src asm
   ; ... stuff above
@@ -152,11 +154,14 @@ Mostly the same boilerplate, although I use ~image-rs~' direct pixel grabbing in
 
 [[../grey.png]]
 
-** COMMENT Optimized
+** Optimized
 
-If you thought the last optimization was a long side tangent, get ready for a whole lot more. I spent about 90% of my time in this assignment trying to make greyscaling quick.
+If you thought the last optimization was a long side tangent, get ready for a whole lot more. I spent most of my time in this assignment trying to make greyscaling quick. Feel free to skip this section.
 
-To begin, it's not immediately obvious /how/ one would actually SIMD-optimize a greyscale when the bytes are laid out as [r g b r g b ... r g b] and we need to process 3 (not even 4, which would be more palatable) components at once. After searching around for a bit, I found an interesting technique detailed [[http://ftp.cvut.cz/kernel/people/geoff/cell/ps3-linux-docs/CellProgrammingTutorial/BasicsOfSIMDProgramming.html][here]] that essentially processes chunks of 12 bytes at a time (or 4 pixels), loads all of the red bytes into a SIMD register, all of the blue into another, and all of the green into a third.
+To begin, it's not immediately obvious /how/ one would actually SIMD-optimize a greyscale when the bytes are laid out as [r g b r g b ... r g b] and we need to process 3 (not even 4, which would be more palatable) components at once.
+
+*** First Attempt
+After searching around for a bit, I found an interesting technique detailed [[http://ftp.cvut.cz/kernel/people/geoff/cell/ps3-linux-docs/CellProgrammingTutorial/BasicsOfSIMDProgramming.html][here]] that essentially processes chunks of 12 bytes at a time (or 4 pixels), loads all of the red bytes into a SIMD register, all of the blue into another, and all of the green into a third.
 
 This has some downsides though: mainly that we're doing a strided access of memory which is a little awkward to implement. Doing manual SIMD is also a journey, especially on ARM. Rust has unsafe wrappers around the NEON instrinsics (thin wrappers around assembly) in ~std::aarch64~, but this means that I spent a good amount of time combing through lists of functions to figure out which one corresponded to the operation I wanted. Since I originally hoped to work with a modified greyscale algorithm that had a weighted average of the R, G, and B values I opted to cast to 32-bit floats and use the intrinsics there to multiply by constants.
 
@@ -202,9 +207,110 @@ Then, there's the big ~unsafe~ block with a bunch of terse function names. These
   let b_simd = vld1q_f32(b.as_ptr());
 #+end_src
 
-Next,
+Next, we multiply each of the R values by 0.33 (approximating division by 1/3 + mostly a legacy from me originally trying to use a different algorithm).
+#+begin_src rust
+  let r_simd = vmulq_n_f32(r_simd, 0.33);
+#+end_src
 
-TODO
+We then do the same to the G and B channels, but continue accumulating the results in the ~r_simd~ register:
+
+#+begin_src rust
+  let r_simd = vmlaq_n_f32(g_simd, r_simd, 0.33);
+  let r_simd = vmlaq_n_f32(b_simd, r_simd, 0.33);
+#+end_src
+
+Then, we finally store the contents of ~r_simd~ (which are now each of the greyscaled pixels) into our ~ret~ array, which we later use to add pixels to the output image.
+#+begin_src rust
+vst1q_f32(ret.as_mut_ptr(), r_simd);
+#+end_src
+
+Alright! Now we have /something/ to work with. All this casting to ~f32~ isn't ideal, and there exist registers than can act on eight ~u8~ at once, which should theoretically be way better!
+
+*** Second Attempt
+Let's just do what we did before but with 8 pixels (24 bytes) at a time! This immediately makes the array loading step much nastier, but the performance tradeoff is still there, so the code stays:
+#+begin_src rust
+  r = [buf[off+0], buf[off+3], buf[off+6], buf[off+ 9], buf[off+12], buf[off+15], buf[off+18], buf[off+21]];
+  g = [buf[off+1], buf[off+4], buf[off+7], buf[off+10], buf[off+13], buf[off+16], buf[off+19], buf[off+22]];
+  b = [buf[off+2], buf[off+5], buf[off+8], buf[off+11], buf[off+14], buf[off+17], buf[off+20], buf[off+23]];
+#+end_src
+
+We obviously can't multiply by a float like before since we're working with a bunch of ~u8~ now, but that isn't a problem, since that system wasn't very necessary to begin with. If we stick to the simple averaging RGB strategy, all we need is integer division, which we have.
+
+[[https://i.imgur.com/IKpPkDV.png]]
+#+begin_center
+Pictured: all ARM NEON division instructions
+
+(excluding reciprocal estimation functions, which are also for ~f32~ data)
+#+end_center
+
+...right? right?
+
+#+begin_quote
+NEON doesn't have any integer division instructions, because they are expensive to implement in hardware. - https://tttapa.github.io/Pages/Raspberry-Pi/NEON/Division.html
+#+end_quote
+
+Amazing. Well, one alternative strategy often used when there is no hardware multiply/divide (which is also recommended by this source) is to work with bit shifts and other arithmetic operations. After some searching, it seemed as if most ways of doing this either required widening the type to a ~u16~ (not great) or doing some really confusing bit math.
+
+/Alternatively/, we could divide by four.
+
+Averaging three numbers by dividing their sum by four is not recommended^{[citation needed]}, but we don't need amazing precision: we just need the image to look grey. Dividing by /four/ is substantially easier: we just bit shift right twice. Since we're staying in ~u8~ form the entire time we have to divide before rather than after (or else we'll overflow), so we simply shift all of the register and then add them:
+
+#+begin_src rust
+let res = vadd_u8(
+	  vadd_u8(
+		  vshr_n_u8(r_simd, 2),
+		  vshr_n_u8(g_simd, 2)
+	  ),
+    vshr_n_u8(b_simd, 2)
+);
+#+end_src
+
+This gives us our complete 8x SIMD function:
+#+begin_src rust
+pub fn simd8_greyscale(buf: &[u8], out: &mut [u8]) {
+	let (mut r, mut g, mut b) = ([0; 8], [0; 8], [0; 8]);
+	let ptr = out.as_mut_ptr();
+	for i in 0..buf.len()/24 {
+		let off = i*24;
+		r = [buf[off+0], buf[off+3], buf[off+6], buf[off+ 9], buf[off+12], buf[off+15], buf[off+18], buf[off+21]];
+		g = [buf[off+1], buf[off+4], buf[off+7], buf[off+10], buf[off+13], buf[off+16], buf[off+19], buf[off+22]];
+		b = [buf[off+2], buf[off+5], buf[off+8], buf[off+11], buf[off+14], buf[off+17], buf[off+20], buf[off+23]];
+		unsafe {
+			let r_simd = vld1_u8(r.as_ptr());
+			let g_simd = vld1_u8(g.as_ptr());
+			let b_simd = vld1_u8(b.as_ptr());
+			let res = vadd_u8(
+				vadd_u8(
+					vshr_n_u8(r_simd, 2),
+					vshr_n_u8(g_simd, 2)
+				),
+				vshr_n_u8(b_simd, 2)
+			);
+			vst1_u8(ptr.add(i*8), res);
+		}
+	}
+}
+#+end_src
+
+*** Benchmarking
+
+After talking some with my friend Riley, he suggested a third, simpler approach that hopefully let the compiler do the work for me (that unfortunately only worked on RGBA images, wasting a byte per pixel):
+#+begin_src rust
+pub fn riley_greyscale(buf: &[u8], out: &mut [u8]) {
+	let pixels: &[u32] = bytemuck::cast_slice::<u8, u32>(buf);
+	for (n, pixel) in pixels.enumerate() {
+		let [r, g, b, _a] = pixel.to_be_bytes();
+		let comp = ((r as u32 + g as u32 + b as u32) / 3) as u8;
+		out[n] = comp;
+	}	
+}
+#+end_src
+
+Benchmarking all 3 of these functions gives the following plot:
+
+[[https://i.imgur.com/BQK0kxU.png]]
+
+Not great. We'd expect ~simd8~ at the very least to be twice as fast as ~simd4~. On top of that, peeking at the assembly for ~riley~ shows that it wasn't even vectorized! It's hard to tell without line-by-line profiling, but my bet is that the awkward strided memory loads probably offset most of the bonus given by SIMD. On top of that, all those shift operations might also cancel some stuff out when it comes to ~simd8~ (or the casts for ~simd4~).
 
 * Exercise 3: RGB exclusion
 #+begin_quote
@@ -237,13 +343,17 @@ For convienence, this function takes a character instead of an index, and then j
 
 Running this with each of the channels R, G, B gives us the following images:
 
-#+begin_flex
+#+begin_flexbox
+#+begin_flexitem
 [[../rgb_r.png]]
-
+#+end_flexitem
+#+begin_flexitem
 [[../rgb_g.png]]
-
+#+end_flexitem
+#+begin_flexitem
 [[../rgb_b.png]]
-#+end_flex
+#+end_flexitem
+#+end_flexbox
 
 ** Optimized
 I didn't forsee there being a nice way to optimize this any more, so I once again just went for the simplification route, letting the compiler do its best and stripping away unnecessary features (like the nice character to channel index converter).
@@ -320,13 +430,17 @@ We can then restrict an image's L channel in LAB space with the following code:
 
 Doing this for each of the channels yields the following images:
 
-#+begin_flex
+#+begin_flexbox
+#+begin_flexitem
 [[../lab_l.png]]
-
+#+end_flexitem
+#+begin_flexitem
 [[../lab_a.png]]
-
+#+end_flexitem
+#+begin_flexitem
 [[../lab_b.png]]
-#+end_flex
+#+end_flexitem
+#+end_flexbox
 
 ** What is LAB?
 #+begin_quote
@@ -364,7 +478,19 @@ Since we implemented the ~restrict~ function in a generic manner, all we need to
   }
 #+end_src
 
-The H channel of an HSV color is /hue/, an angle describing a position in a standard color wheel. The S channel, /saturation/, is roughly a measure of the intensity of the color. Finally, the V channel represents /value/ which is a measure of how bright the color is.
+The H channel of an HSV color is /hue/, an angle describing a position in a standard color wheel. The S channel, /saturation/, is roughly a measure of the intensity of the color. Finally, the V channel represents /value/ which is a measure of how bright the color is. We can see this by dropping off each of the channels respectively:
+
+#+begin_flexbox
+#+begin_flexitem
+[[../hsv_h.png]]
+#+end_flexitem
+#+begin_flexitem
+[[../hsv_s.png]]
+#+end_flexitem
+#+begin_flexitem
+[[../hsv_v.png]]
+#+end_flexitem
+#+end_flexbox
 
 Thus, dropping H (hue) and S (saturation) should give a equivalent of a greyscale image: an image with the default hue (red) but no color intensity (so ultimately grey) that still retains brightness (hence greyscale).
 
