@@ -1,0 +1,442 @@
+
+
+#+TITLE: Image Manipulation
+#+HTML_HEAD: <link rel="stylesheet" href="https://quantumish.github.io/org.css">
+
+This is my writeup for the first assignment! Please run the associated code in the root directory first by running:
+#+begin_src sh
+  # download needed images
+  wget https://i.imgur.com/fyDOvfz.jpg image1.jpg
+  wget https://i.imgur.com/0DANhnn.jpg image2.jpg
+  # run generator script for this assignment
+  cargo run --example image-manipulation
+#+end_src
+This will generate the images referenced by this document. Alternatively, see the online copy at TODO (if /this/ is the online copy, you can ignore all of this).
+
+I used ~image-rs~ for my base implementation of the exercises: it's a handy high level library for working with images in Rust, although its abstractions come with some annoyances sometimes.
+
+* Exercise 1: dimming
+#+begin_quote
+Recall from lecture that the value of each pixel represents its brightness. Implement a function that takes in an image and returns the same image, but half as bright as the original image.
+#+end_quote
+
+Writing such a function is pretty straightforward - although I do a bit more than I have to. I chose to preemptively allocate the correct amount of space for the vector so that I wouldn't have to lose a bit of time to reallocation. I then add all the values to the vector using ~extend~ to consume the entire iterator. I also opted to take a integer "division factor" instead of just an arbitrary fraction, since then I could stick to simple integer division and not worry about casting to a float and back.
+#+begin_src rust
+  pub fn dim(img: DynamicImage, factor: u8) -> Result<DynamicImage> {
+      let (w, h) = img.dimensions();
+      let mut out: Vec<u8> = Vec::with_capacity((w*h*3) as usize);
+      out.extend(img.as_bytes().iter().map(|i| i/factor));	
+      let buf = ImageBuffer::from_vec(w, h, out)
+          .ok_or(anyhow!("Couldn't convert buffer."))?;
+      Ok(DynamicImage::ImageRgb8(buf))
+  }
+#+end_src
+
+[[../dim.png]]
+
+# ** Testing
+
+# My test for this function wasn't that complicated: just check if at least the red pixels are actually half the value they were before!
+# #+begin_src rust
+#   #[test]
+#   fn dim() {
+#       let img = utils::gen_image(64);
+#       let out = super::dim(img.clone(), 2).unwrap();
+#       assert_eq!(out.get_pixel(0,0)[0], img.get_pixel(0,0)[0]/2);
+#   }
+# #+end_src
+
+** Optimized
+
+How do we make this function quick? It's actually not that hard! The compiler does most of the work for us - and in general trying to out-optimize the compiler can be a long and painful battle not often worth fighting. The one big change though is that we get a whole lot simpler: let the user handle the ~image-rs~ stuff, and just give the the function an input and output buffer.
+
+#+begin_src rust
+  pub fn dim(bytes: &[u8], out: &mut [u8], factor: u8) {
+      for (n, i) in bytes.iter().enumerate() {
+          out[n] = i/factor;
+      }
+  }
+#+end_src
+
+Glancing at the assembly output of ~cargo asm~ (an awesome tool you can install with =cargo install cargo-asm=!) we might be disappointed to see that the compiler is /not/ using SIMD instructions to dim many bytes of RGB at once!
+
+#+begin_src asm
+  ; ... stuff above
+  ; out[n] = i/factor;
+  ldrb    w11, [x9]
+  add     x12, x9, #1
+  and     w9, w4, #0xff
+  udiv    w9, w11, w9 ; <-- only a udiv?? really?
+  ; stuff below...
+#+end_src
+
+This is likely due to the fact that ARM's NEON intrinsics (their version of SIMD) don't have an instruction for unsigned 8-bit integer divide, which I would only find out later.
+
+We can do a bit better though, since the assignment does specifically say we want to dim by half, and so the generality of a ~factor~ argument is technically not needed. We can then instead hard code division by 2 into a ~dim2~ function like so:
+
+#+begin_src rust
+  pub fn dim2(bytes: &[u8], out: &mut [u8]) {
+      for (n, i) in bytes.iter().enumerate() {
+          out[n] = i/2;
+      }
+  }
+#+end_src
+
+Looking at the assembly output there shows that it now uses the SIMD we desired: dimming 16 bytes of the image at a time! It also uses a slightly faster right shift instruction, which makes sense since dividing by two is equivalent to shifting a number right in binary (just like how 12/10 = 1.2)!
+
+#+begin_src asm
+  ; ... stuff above
+  ; out[n] = i/2;
+  ldr      q0, [x10], #16
+  ushr.16b v0, v0, #1 ; <-- yay! SIMD and a faster instruction
+  ; stuff below ...
+#+end_src
+
+We can further demonstrate the improvement by using ~criterion~, another great Rust tool for benchmarking. Let's quickly try generating random images of exponentially increasing size and see how they compare!
+
+You may notice I put the number two in a ~black_box~, which is a utility from ~criterion~ that makes values opaque to the compiler so it doesn't be too clever when optimizing. It's likely an overly paranoid usage here though, as as it shouldn't be able to do much about it.
+
+#+begin_src rust
+  fn bench_dims(c: &mut Criterion) {
+      let mut group = c.benchmark_group("Dimming");
+      for sz in 8..14 {
+          let sz = 2_u32.pow(sz);
+          let img = utils::gen_image(sz);
+          group.bench_with_input(BenchmarkId::new("dim", sz), &img, |b, i| {
+              let (w, h) = i.dimensions();
+              let mut out: Vec<u8> = vec![0; (w*h*3) as usize];		
+              let bytes = i.as_bytes();
+              b.iter(|| optimized::cpu::dim(&bytes[..], &mut out[..], black_box(2)))
+          });
+          group.bench_with_input(BenchmarkId::new("dim2", sz), &img, |b, i| {
+              let (w, h) = i.dimensions();
+              let mut out: Vec<u8> = vec![0; (w*h*3) as usize];		
+              let bytes = i.as_bytes();
+              b.iter(|| optimized::cpu::dim2(&bytes[..], &mut out[..]))
+          });
+      }
+  }
+#+end_src
+
+We can then visualize the difference:
+
+#+begin_center
+#+ATTR_ORG: :width 400
+[[../dimming.svg]]
+#+end_center
+
+Woah! That's a pretty serious difference, although it makes some sense given how ~dim2~ not only processes 16 bytes at a time but also uses a right shift. They're both still increasing at the same rate, but even that linear speedup has a very distinct difference in real world cases.
+
+* Exercise 2: Convert to greyscale
+#+begin_quote
+Implement a function that takes in an RGB color image and outputs that same image in grayscale.
+#+end_quote
+
+Mostly the same boilerplate, although I use ~image-rs~' direct pixel grabbing interface this time. Addition of the R, G, and B values requires widening the bytes to 16-bit so there aren't any overflows and then casting back to an 8-bit int in the end.
+#+begin_src rust
+  pub fn greyscale(img: DynamicImage) -> Result<DynamicImage> {	
+      let (w, h) = img.dimensions();
+      let mut out: Vec<u8> = vec![0; (w*h) as usize];	
+      for (n, i) in img.pixels().enumerate() {
+          let vals = i.2.0;
+          let sum = vals[0] as u16
+              + vals[1] as u16
+              + vals[2] as u16;
+          out[n] = (sum/3) as u8;
+      }
+      let buf = ImageBuffer::from_vec(w, h, out)
+          .ok_or(anyhow!("Couldn't convert buffer."))?;
+      Ok(DynamicImage::ImageLuma8(buf)) // encode image as greyscale	
+  }
+#+end_src
+
+[[../grey.png]]
+
+** COMMENT Optimized
+
+If you thought the last optimization was a long side tangent, get ready for a whole lot more. I spent about 90% of my time in this assignment trying to make greyscaling quick.
+
+To begin, it's not immediately obvious /how/ one would actually SIMD-optimize a greyscale when the bytes are laid out as [r g b r g b ... r g b] and we need to process 3 (not even 4, which would be more palatable) components at once. After searching around for a bit, I found an interesting technique detailed [[http://ftp.cvut.cz/kernel/people/geoff/cell/ps3-linux-docs/CellProgrammingTutorial/BasicsOfSIMDProgramming.html][here]] that essentially processes chunks of 12 bytes at a time (or 4 pixels), loads all of the red bytes into a SIMD register, all of the blue into another, and all of the green into a third.
+
+This has some downsides though: mainly that we're doing a strided access of memory which is a little awkward to implement. Doing manual SIMD is also a journey, especially on ARM. Rust has unsafe wrappers around the NEON instrinsics (thin wrappers around assembly) in ~std::aarch64~, but this means that I spent a good amount of time combing through lists of functions to figure out which one corresponded to the operation I wanted. Since I originally hoped to work with a modified greyscale algorithm that had a weighted average of the R, G, and B values I opted to cast to 32-bit floats and use the intrinsics there to multiply by constants.
+
+#+begin_src rust
+  pub fn simd4_greyscale(buf: &[u8], out: &mut [u8]) {
+      for i in 0..buf.len()/12 {
+          let off = i*12;
+          let r = [buf[off + 0] as f32, buf[off + 3] as f32, buf[off + 6] as f32, buf[off + 9] as f32];
+          let g = [buf[off + 1] as f32, buf[off + 4] as f32, buf[off + 7] as f32, buf[off + 10] as f32];
+          let b = [buf[off + 2] as f32, buf[off + 5] as f32, buf[off + 8] as f32, buf[off + 11] as f32];
+          let mut ret = [0.0; 4];
+          unsafe {
+              let r_simd = vld1q_f32(r.as_ptr());
+              let g_simd = vld1q_f32(g.as_ptr());
+              let b_simd = vld1q_f32(b.as_ptr());
+              let r_simd = vmulq_n_f32(r_simd, 0.33);
+              let r_simd = vmlaq_n_f32(g_simd, r_simd, 0.33);
+              let r_simd = vmlaq_n_f32(b_simd, r_simd, 0.33);
+              vst1q_f32(ret.as_mut_ptr(), r_simd);
+          }
+          for j in 0..4 {
+              out[i*4 + j] = ret[j] as u8;
+          }
+      }
+  }
+#+end_src
+
+I'm gonna dive into a bit more depth with this function, mostly because it's quite a bit more unreadable than everything else I've shown thus far. First off (pun intended), the loop and ~off~ calculation is used for loading the image data 12 bytes at a time as mentioned earlier. The next thing you notice is the huge block of array logic:
+
+#+begin_src rust
+  let r = [buf[off + 0] as f32, buf[off + 3] as f32, buf[off + 6] as f32, buf[off + 9] as f32];
+  let g = [buf[off + 1] as f32, buf[off + 4] as f32, buf[off + 7] as f32, buf[off + 10] as f32];
+  let b = [buf[off + 2] as f32, buf[off + 5] as f32, buf[off + 8] as f32, buf[off + 11] as f32];
+#+end_src
+
+This is used to extract each of the red, green, and blue bytes from the 12-byte subsequence we're processing and cast them to ~f32~ so we can use them. You might wonder why this is all manually typed out instead of written as a nice loop. All of this logic is run every time we process four pixels, and so adding extra conditionals and logic actually has an impact on the runtime.
+
+Then, there's the big ~unsafe~ block with a bunch of terse function names. These are the NEON intrinsics! We start off by loading the r, g, and b arrays we made into SIMD registers.
+
+#+begin_src rust
+  let r_simd = vld1q_f32(r.as_ptr());
+  let g_simd = vld1q_f32(g.as_ptr());
+  let b_simd = vld1q_f32(b.as_ptr());
+#+end_src
+
+Next,
+
+TODO
+
+* Exercise 3: RGB exclusion
+#+begin_quote
+Implement a function that takes in an image and a channel, and returns an image without the specified channel.
+#+end_quote
+
+For convienence, this function takes a character instead of an index, and then just maps it to one using a small switch (~match~ really) statement. This is also handleable with a good ~map~ call, and so for succinctness I went with that again.
+
+#+begin_src rust
+  pub fn rgb_restrict(img: DynamicImage, channel: char) -> Result<DynamicImage> {
+      let (w, h) = img.dimensions();
+      let mut out: Vec<u8> = Vec::with_capacity((w*h*3) as usize);	
+      let index = match channel {
+          'R' => 0,
+          'G' => 1,
+          'B' => 2,
+          _ => { return Err(anyhow!("Invalid color channel")); }
+      };
+      out.extend(&mut
+                 img.as_bytes()
+                 .iter()
+                 .enumerate()
+                 .map(|(n,i)| if n % 3 == index { 0 } else { *i })
+      );
+      let buf = ImageBuffer::from_vec(w, h, out)
+          .ok_or(anyhow!("Couldn't convert buffer"))?;
+      Ok(DynamicImage::ImageRgb8(buf))
+  }
+#+end_src
+
+Running this with each of the channels R, G, B gives us the following images:
+
+#+begin_flex
+[[../rgb_r.png]]
+
+[[../rgb_g.png]]
+
+[[../rgb_b.png]]
+#+end_flex
+
+** Optimized
+I didn't forsee there being a nice way to optimize this any more, so I once again just went for the simplification route, letting the compiler do its best and stripping away unnecessary features (like the nice character to channel index converter).
+
+#+begin_src rust
+  pub fn exclude(bytes: &[u8], out: &mut [u8], index: usize) {
+      for n in 0..bytes.len() {
+          if n % 3 == index {
+              out[n] = 0;
+          }
+      }
+  }
+#+end_src
+
+No SIMD to gain here, unfortunately. 
+
+* Advanced Exercise 1
+#+begin_quote
+Implement a function that takes in an image and an LAB channel, and returns an image without the specified channel.
+#+end_quote
+
+I used a rust library for color space handling called ~palette~ - it provides ~IntoColor~ and ~FromColor~ traits that allow for conversion between a number of predefined color sets: ~Lab~, ~Srgb~, ~Hsv~, etc. Reading ahead a little bit, I noticed the next exercise had us do something very similar but with HSV, so I went ahead and did a bit of generalization.
+
+Let's define a ~ColorChannel~ trait that requires a struct be convertible to and from ~Srgb~ as well as support zeroing out a user-supplied channel.
+#+begin_src rust
+  pub trait ColorChannel: IntoColor<Srgb> + FromColor<Srgb> {
+      fn zero_channel(&mut self, channel: char) -> Result<()>;
+  }
+#+end_src
+
+We can then quickly implement this trait for ~Lab~:
+
+#+begin_src rust
+  impl ColorChannel for Lab {
+      fn zero_channel(&mut self, channel: char) -> Result<()> {
+          match channel.to_ascii_uppercase() {
+              'L' => self.l = 0.0,
+              'A' => self.a = 0.0,
+              'B' => self.b = 0.0,
+              _ => { return Err(anyhow!("Invalid color channel")); }
+          }
+          Ok(())
+      }
+  }
+#+end_src
+
+Now with this out of the way, we can implement the restriction function generically for any color space ~Space~ by converting each pixel's RGB value to it, zeroing out the user supplied channel, and converting it back to RGB.
+
+#+begin_src rust
+  pub fn restrict<Space: ColorChannel>(img: DynamicImage, channel: char) -> Result<DynamicImage> {
+      let (w, h) = img.dimensions();
+      let mut out: Vec<u8> = Vec::with_capacity((w*h*3) as usize);
+      for i in img.pixels() {
+          let rgb = Srgb::from_components(
+              (i.2.0[0], i.2.0[1], i.2.0[2])			
+          ).into_format::<f32>();
+          let mut color: Space = rgb.into_color();
+          color.set_channel(channel)?;
+          let orig: Srgb = color.into_color();
+          let orig = orig.into_format::<u8>().into_components();
+          out.extend([orig.0, orig.1, orig.2]);
+      }	
+      let buf = ImageBuffer::from_vec(w, h, out)
+          .ok_or(anyhow!("Couldn't convert buffer"))?;
+      Ok(DynamicImage::ImageRgb8(buf))
+  }
+#+end_src
+
+We can then restrict an image's L channel in LAB space with the following code:
+
+#+begin_src rust
+  let out = restrict::<Lab>(img, 'L').unwrap();  
+#+end_src
+
+Doing this for each of the channels yields the following images:
+
+#+begin_flex
+[[../lab_l.png]]
+
+[[../lab_a.png]]
+
+[[../lab_b.png]]
+#+end_flex
+
+** What is LAB?
+#+begin_quote
+Explain what the L, A and B channels are and what happens when you take away the L and A channels.
+#+end_quote
+
+The LAB colorspace (CIELAB? L*a*b*?) is one designed to better match human perception: the L channel represents the /lightness/ of the image, the  channel is a color scale from red to green, and the B channel is a color scale from orange to blue. This is because humans generally process color in this manner: you can't picture an "orangish blue" or a "reddish green" because your brain perceives colors as a scale between them.
+
+We can expect taking away the L (lightness) and A (red-green) scales to provide us with a very dim image that primarily consists of orange and blue.
+
+[[../lab_la.png]]
+
+And that's what we see!
+
+* Advanced Exercise 2
+#+begin_quote
+Explain what the H, S and V channels are and what happens when you take away the both the H and S channels.
+
+It may help you to implement a function that performs HSV decomposition and removes these channels; this is optional.
+#+end_quote
+
+Since we implemented the ~restrict~ function in a generic manner, all we need to do is implement the ~ColorChannel~ trait for HSV! The one notable difference is that since hue is an angle we have to initialize it more intentionally.
+
+#+begin_src rust
+  impl ColorChannel for Hsv {
+      fn zero_channel(&mut self, channel: char) -> Result<()> {
+          match channel.to_ascii_uppercase() {
+              'H' => self.hue = RgbHue::from_degrees(0.0),
+              'S' => self.saturation = 0.0,
+              'V' => self.value = 0.0,
+              _ => { return Err(anyhow!("Invalid color channel")); }
+          }
+          Ok(())
+      }
+  }
+#+end_src
+
+The H channel of an HSV color is /hue/, an angle describing a position in a standard color wheel. The S channel, /saturation/, is roughly a measure of the intensity of the color. Finally, the V channel represents /value/ which is a measure of how bright the color is.
+
+Thus, dropping H (hue) and S (saturation) should give a equivalent of a greyscale image: an image with the default hue (red) but no color intensity (so ultimately grey) that still retains brightness (hence greyscale).
+
+[[../hsv_hs.png]]
+
+Once again, that's what we see!
+
+* Advanced Exercise 3
+#+begin_quote
+Implement the following method, which takes in two images and returns a new image where the left half of the image is the left half of image1 and the right half of the image is the right half of image2. Exclude the specified channel for the given image. 
+#+end_quote
+
+First off, let's make a function that combines images. ~image-rs~ has a nice feature where you can generate an image from a lambda function that returns pack the value of a given pixel coordinate. Combined with the utilities for fetching a pixel from an image given some coordinates, this makes generating a combined image quite simple.
+
+#+begin_src rust
+  pub fn combine(img: DynamicImage, img2: DynamicImage) -> Result<DynamicImage> {
+      if img.dimensions() != img2.dimensions() {
+          return Err(anyhow!("Images not same size"));
+      }
+      let (w, h) = img.dimensions();
+      let img = ImageBuffer::from_fn(w, h, |x, y| {
+          if x > w/2 {			
+              img2.get_pixel(x, y)
+          } else {
+              img.get_pixel(x, y)			
+          }
+      });
+      Ok(DynamicImage::ImageRgba8(img))
+  }
+#+end_src
+
+Since we already have a way of restricting RGB channels, we can now use both to build up this function.
+
+#+begin_src rust
+  pub fn fancy_combine(img1: DynamicImage, img2: DynamicImage, channel1: char, channel2: char) {
+      let img2 = rgb_restrict(img2.clone(), channel1).unwrap();
+      let img1 = rgb_restrict(img1.clone(), channel2).unwrap();	
+      combine(img1, img2).unwrap()
+  }
+#+end_src
+
+Using this we can now make a combined image with distinctly excluded channels!
+
+[[../combined.png]]
+
+* Advanced Exercise 4
+
+#+begin_quote
+Implement a function that takes a single image, and performs a different operation to each of the 4 quadrants of the image, returning an image that merges the 4 quadrants back together.
+#+end_quote
+
+We can use the same lambda-based method but handle each corner differently:
+
+#+begin_src rust
+  pub fn quarters(img: DynamicImage) -> DynamicImage {
+      let (w, h) = img.dimensions();
+      let img = ImageBuffer::from_fn(w, h, |x, y| {
+          let orig = img.get_pixel(x, y);
+          if x > w/2 && y > h/2 {			
+              Rgba::<u8>([orig[0].checked_mul(2).unwrap_or(255), orig[1]/2, orig[2], orig[3]])
+          } else if x > w/2 && y < h/2 {
+              let sum = orig[0] as u16 + orig[1] as u16 + orig[2] as u16;
+              let avg = (sum/3) as u8;
+              Rgba::<u8>([avg, avg, avg, orig[3]])
+          } else if x < w/2 && y > h/2 {
+              Rgba::<u8>([orig[2], orig[1], orig[0], orig[3]])
+          } else {
+              Rgba::<u8>([orig[0], orig[1], orig[2], orig[3]/4])
+          }
+      });
+      DynamicImage::ImageRgba8(img)
+  }
+#+end_src
+
+[[../quarters.png]]

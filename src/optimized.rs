@@ -1,4 +1,6 @@
 pub mod cpu {
+	use std::arch::aarch64::*;
+	
 	///
 	/// TODO Write the rest of this docstring
 	/// Algorithm is inspired by
@@ -15,9 +17,9 @@ pub mod cpu {
 				let r_simd = vld1q_f32(r.as_ptr());
 				let g_simd = vld1q_f32(g.as_ptr());
 				let b_simd = vld1q_f32(b.as_ptr());
-				vmulq_n_f32(r_simd, 0.33);
-				vmlaq_n_f32(g_simd, r_simd, 0.33);
-				vmlaq_n_f32(b_simd, r_simd, 0.33);
+				let r_simd = vmulq_n_f32(r_simd, 0.33);
+				let r_simd = vmlaq_n_f32(g_simd, r_simd, 0.33);
+				let r_simd = vmlaq_n_f32(b_simd, r_simd, 0.33);				
 				vst1q_f32(ret.as_mut_ptr(), r_simd);
 			}
 			for j in 0..4 {
@@ -49,4 +51,39 @@ pub mod cpu {
 			}
 		}
 	}
+
+	pub fn dim(bytes: &[u8], out: &mut [u8], factor: u8) {
+		for (n, i) in bytes.iter().enumerate() {
+			out[n] = i/factor;
+		}
+	}
+
+	pub fn dim2(bytes: &[u8], out: &mut [u8]) {
+		for (n, i) in bytes.iter().enumerate() {
+			out[n] = i/2;
+		}
+	}
+
+	pub fn exclude(bytes: &[u8], out: &mut [u8], index: usize) {
+		for n in 0..bytes.len() {
+			if n % 3 == index {
+				out[n] = 0;
+			}
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+		
+		#[test]
+		fn dim() {
+			let img = utils::gen_image(64);
+			let out = super::dim(img.clone(), 2).unwrap();
+			assert_eq!(out.get_pixel(0,0)[0], img.get_pixel(0,0)[0]/2);
+		}
+	}
+
 }
+
+// mod gpu() 

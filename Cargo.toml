@@ -22,5 +22,5 @@ rand = "0.8.5"
 name = "my_benchmark"
 harness = false
 
-# [[example]]
-# name = "foo"
+[[example]]
+name = "image-manipulation"

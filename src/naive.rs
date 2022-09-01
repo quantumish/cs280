@@ -1,9 +1,10 @@
 use crate::utils;
-use image::{Rgba, DynamicImage, GenericImageView, ImageBuffer};
+use image::{GenericImageView, ImageBuffer};
+use image::{Rgba, DynamicImage};
 use anyhow::{Result, anyhow};
 use palette::{Srgb, Lab, Hsv, IntoColor, FromColor, RgbHue};
 
-pub fn greyscale(img: DynamicImage) -> Vec<u8> {	
+pub fn greyscale(img: DynamicImage) -> Result<DynamicImage> {	
 	let (w, h) = img.dimensions();
 	let mut out: Vec<u8> = vec![0; (w*h) as usize];	
 	for (n, i) in img.pixels().enumerate() {
@@ -13,7 +14,9 @@ pub fn greyscale(img: DynamicImage) -> Vec<u8> {
 			+ vals[2] as u16;
 		out[n] = (sum/3) as u8;
 	}
-	out
+	let buf = ImageBuffer::from_vec(w, h, out)
+		.ok_or(anyhow!("Couldn't convert buffer."))?;
+	Ok(DynamicImage::ImageLuma8(buf))	
 }
 
 pub fn dim(img: DynamicImage, factor: u8) -> Result<DynamicImage> {
@@ -27,7 +30,7 @@ pub fn dim(img: DynamicImage, factor: u8) -> Result<DynamicImage> {
 
 pub fn rgb_restrict(img: DynamicImage, channel: char) -> Result<DynamicImage> {
 	let (w, h) = img.dimensions();
-	let mut out: Vec<u8> = Vec::with_capacity((w*h*3) as usize);
+	let mut out: Vec<u8> = Vec::with_capacity((w*h*3) as usize);	
 	let index = match channel {
 		'R' => 0,
 		'G' => 1,
@@ -46,11 +49,11 @@ pub fn rgb_restrict(img: DynamicImage, channel: char) -> Result<DynamicImage> {
 }
 
 pub trait ColorChannel: IntoColor<Srgb> + FromColor<Srgb> {
-	fn set_channel(&mut self, channel: char) -> Result<()>;
+	fn zero_channel(&mut self, channel: char) -> Result<()>;
 }
 
 impl ColorChannel for Lab {
-	fn set_channel(&mut self, channel: char) -> Result<()> {
+	fn zero_channel(&mut self, channel: char) -> Result<()> {
 		match channel.to_ascii_uppercase() {
 			'L' => self.l = 0.0,
 			'A' => self.a = 0.0,
@@ -62,7 +65,7 @@ impl ColorChannel for Lab {
 }
 
 impl ColorChannel for Hsv {
-	fn set_channel(&mut self, channel: char) -> Result<()> {
+	fn zero_channel(&mut self, channel: char) -> Result<()> {
 		match channel.to_ascii_uppercase() {
 			'H' => self.hue = RgbHue::from_degrees(0.0),
 			'S' => self.saturation = 0.0,
@@ -81,7 +84,7 @@ pub fn restrict<Space: ColorChannel>(img: DynamicImage, channel: char) -> Result
 			(i.2.0[0], i.2.0[1], i.2.0[2])			
 		).into_format::<f32>();
 		let mut color: Space = rgb.into_color();
-		color.set_channel(channel)?;
+		color.zero_channel(channel)?;
 		let orig: Srgb = color.into_color();
 		let orig = orig.into_format::<u8>().into_components();
 		out.extend([orig.0, orig.1, orig.2]);
