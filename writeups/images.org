@@ -13,7 +13,7 @@ This is my writeup for the first assignment! Please run the associated code in t
   # run generator script for this assignment
   cargo run --example image-manipulation
 #+end_src
-This will generate the images referenced by this document. Alternatively, see the online copy at TODO (if /this/ is the online copy, you can ignore all of this).
+This will generate the images referenced by this document. Alternatively, see the online copy [[https://quantumish.github.io/images.html][here]] (if /this/ is the online copy, you can ignore all of this).
 
 I used ~image-rs~ for my base implementation of the exercises: it's a handy high level library for working with images in Rust, although its abstractions come with some annoyances sometimes.
 
