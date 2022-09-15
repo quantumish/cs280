@@ -1,6 +1,9 @@
 # """
 # This file implements the functions described in the writeup, and is used to generate the images/results.
-
+#
+# You may need to install Numba with `pip install numba` - otherwise the core packages needed are
+# scikit-image, matplotlib, and numpy
+#
 # To reproduce, place your dog photo in the working directory and rename it to dog.jpg. Additionally, run
 # ```
 # wget https://upload.wikimedia.org/wikipedia/commons/thumb/b/b6/Image_created_with_a_mobile_phone.png/440px-Image_created_with_a_mobile_phone.png -O image.png
